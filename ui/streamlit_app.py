@@ -71,8 +71,12 @@ def run() -> None:
                 workflow_status(result.get("status", "Answer generated"), result.get("errors"))
                 st.session_state.last_state = result
             except Exception as exc:
-                answer = f"I could not complete the request: {exc}"
+                import traceback
+                error_msg = str(exc)
+                error_trace = traceback.format_exc()
+                answer = f"I could not complete the request: {error_msg}"
                 placeholder.error(answer)
+                st.error(f"Debug info:\n```\n{error_trace}\n```")
             st.session_state.messages.append({"role": "assistant", "content": answer})
     st.subheader("🕸️ Knowledge Graph Visualization")
     search = st.text_input("Search nodes", placeholder="Type an entity name...")
