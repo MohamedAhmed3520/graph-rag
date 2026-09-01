@@ -1,8 +1,3 @@
-"""LLM factory for OpenRouter-compatible chat models.
-
-The LangChain OpenAI integration is imported lazily so Streamlit can render
-configuration/help screens even before optional dependencies are installed.
-"""
 from __future__ import annotations
 
 from typing import Any
@@ -18,22 +13,37 @@ AVAILABLE_MODELS: list[str] = [
 ]
 
 
-def create_llm(settings: Settings | None = None, model: str | None = None, temperature: float | None = None) -> Any:
+def create_llm(
+    settings: Settings | None = None,
+    model: str | None = None,
+    temperature: float | None = None,
+) -> Any:
     """Create an OpenRouter-backed LangChain chat model."""
+
     try:
         from langchain_openai import ChatOpenAI
-    except ImportError as exc:  # pragma: no cover - environment dependent
+    except ImportError as exc:
         raise RuntimeError(
-            "Missing dependency 'langchain-openai'. Install project dependencies with "
-            "`uv pip install -r requirements.txt` or `pip install -r requirements.txt`."
+            "Missing dependency 'langchain-openai'."
         ) from exc
 
     cfg = settings or get_settings()
-    return ChatOpenAI(
+
+    llm = ChatOpenAI(
         model=model or cfg.llm_model,
-        temperature=cfg.llm_temperature if temperature is None else temperature,
+        temperature=(
+            cfg.llm_temperature
+            if temperature is None
+            else temperature
+        ),
         api_key=cfg.require_openrouter_key(),
         base_url=cfg.openrouter_base_url,
         timeout=cfg.request_timeout,
-        default_headers={"HTTP-Referer": "http://localhost:8501", "X-Title": cfg.app_name},
+        max_retries=2,
+        default_headers={
+            "HTTP-Referer": "https://your-streamlit-app.streamlit.app",
+            "X-Title": cfg.app_name,
+        },
     )
+
+    return llm
