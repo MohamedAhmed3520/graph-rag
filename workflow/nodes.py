@@ -85,43 +85,57 @@ def grade_retrieved_context(state: GraphRAGState) -> GraphRAGState:
     """Grade whether retrieved context sufficiently answers the question.
     
     Parses JSON response from LLM and normalizes to "sufficient" or "insufficient".
-    Handles malformed JSON gracefully.
+    Handles malformed JSON gracefully, including bare strings like "sufficient".
     """
+    from utils.logger import get_logger
+    
+    logger = get_logger(__name__)
     llm = create_llm()
     content = GRADING_PROMPT.format(question=state.get("question", ""), context=state.get("merged_context", ""))
-    response = llm.invoke([HumanMessage(content=content)]).content.strip()
     
-    # Try to parse JSON response
+    try:
+        response = llm.invoke([HumanMessage(content=content)]).content.strip()
+    except Exception as exc:
+        logger.warning("Failed to invoke grading LLM: %s", exc)
+        return {**state, "grade": "insufficient", "status": "Context grading failed (LLM error)"}
+    
     grade = "insufficient"  # default to insufficient
+    
     try:
         # Try to extract JSON from code fences if present
+        json_str = response
         if "```json" in response:
             json_str = response.split("```json")[1].split("```")[0].strip()
         elif "```" in response:
             json_str = response.split("```")[1].split("```")[0].strip()
-        else:
-            json_str = response
         
+        # Attempt to parse JSON
         data = json.loads(json_str)
         
-        # Extract the "sufficient" field
+        # Handle different response formats
         if isinstance(data, dict):
+            # Standard format: {"sufficient": boolean, ...}
             sufficient = data.get("sufficient")
-            # Convert to boolean if it's a string
             if isinstance(sufficient, str):
                 sufficient = sufficient.lower() in ("true", "yes", "1")
-            
-            if sufficient is True:
-                grade = "sufficient"
-            else:
-                grade = "insufficient"
-    except (json.JSONDecodeError, KeyError, ValueError, IndexError):
-        # Fallback: check if response contains "sufficient" or "yes"
+            grade = "sufficient" if sufficient is True else "insufficient"
+        elif isinstance(data, str):
+            # Bare string format: "sufficient" or "insufficient"
+            grade = "sufficient" if data.lower() in ("sufficient", "yes", "true") else "insufficient"
+        elif isinstance(data, bool):
+            # Boolean format: true or false
+            grade = "sufficient" if data is True else "insufficient"
+        
+        logger.debug("Grading response parsed: %s -> %s", data, grade)
+    except (json.JSONDecodeError, KeyError, ValueError, IndexError, AttributeError) as exc:
+        logger.debug("JSON parsing failed (%s), using fallback text parsing", exc)
+        # Fallback: parse raw text response
         lower_response = response.lower()
         if "sufficient" in lower_response or "yes" in lower_response:
             grade = "sufficient"
         else:
             grade = "insufficient"
+        logger.debug("Fallback text parsing: %s -> %s", response, grade)
     
     return {**state, "grade": grade, "status": "Context graded"}
 
