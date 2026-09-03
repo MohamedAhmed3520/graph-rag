@@ -1,4 +1,4 @@
-```python
+
 """Production Streamlit interface for Graph RAG."""
 from __future__ import annotations
 
@@ -861,4 +861,3 @@ def render_app() -> None:
 
 if __name__ == "__main__":
     run()
-```
