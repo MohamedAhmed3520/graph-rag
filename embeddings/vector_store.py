@@ -1,9 +1,9 @@
-"""FAISS vector index management."""
+"""Persistent FAISS index with explicit vector-to-chunk mapping."""
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import faiss
 import numpy as np
@@ -23,175 +23,304 @@ class VectorRecord:
 
 
 class FaissVectorStore:
-    """Persisted dense vector index plus document store."""
-
     def __init__(
         self,
         index_path: Path | Settings,
         docstore_path: Path | None = None,
         embedding_model_name: str | None = None,
-    ) -> None:
-        """Initialize the vector store.
-
-        The production UI and workflow pass a ``Settings`` instance, while some
-        lower-level tests/tools may pass explicit paths. Supporting both keeps
-        the storage layer convenient without leaking path construction into UI
-        code.
-        """
+    ):
         if isinstance(index_path, Settings):
-            settings = index_path
-            self.index_path = Path(settings.faiss_index_path)
-            self.docstore_path = Path(settings.faiss_docstore_path)
-            self.embedding_model_name = embedding_model_name or settings.embedding_model
+            cfg = index_path
+            self.index_path = Path(cfg.faiss_index_path)
+            self.docstore_path = Path(cfg.faiss_docstore_path)
+            self.embedding_model_name = (
+                embedding_model_name or cfg.embedding_model
+            )
         else:
             if docstore_path is None:
-                raise ValueError("docstore_path is required when index_path is not a Settings instance.")
+                raise ValueError(
+                    "docstore_path is required when index_path is not Settings"
+                )
+
             self.index_path = Path(index_path)
             self.docstore_path = Path(docstore_path)
             self.embedding_model_name = embedding_model_name
-        self.embedding_model = None
+
+        self.embedding_model: EmbeddingModel | None = None
         self.dimension: int | None = None
+
+        self.docstore: dict[str, VectorRecord] = {}
+        self.index_to_chunk_id: list[str] = []
+
         self.index = self._load_index()
-        self.docstore: dict[str, VectorRecord] = self._load_docstore()
+
+        self._load_docstore()
+        self._validate_mapping()
 
     def _get_embedding_model(self) -> EmbeddingModel:
         if self.embedding_model is None:
-            self.embedding_model = EmbeddingModel(self.embedding_model_name)
+            self.embedding_model = EmbeddingModel(
+                self.embedding_model_name
+            )
             self.dimension = self.embedding_model.dimension
+
         return self.embedding_model
 
-    def _ensure_dimension(self) -> int:
-        """Resolve and cache the embedding dimension."""
-        if self.dimension is None:
-            self._get_embedding_model()
-        if self.dimension is None:
-            raise RuntimeError("Embedding dimension could not be determined.")
-        return self.dimension
-
     def _create_empty_index(self) -> faiss.Index:
-        """Create an empty FAISS index using the configured embedding dimension."""
-        return faiss.IndexFlatIP(self._ensure_dimension())
+        dimension = (
+            self.dimension
+            or self._get_embedding_model().dimension
+        )
+
+        return faiss.IndexFlatIP(dimension)
 
     def _load_index(self) -> faiss.Index:
         if self.index_path.exists():
-            return faiss.read_index(str(self.index_path))
-        # Default to loading the embedding model lazily only when a new index
-        # must be created. Existing persisted indexes can be loaded without it.
+            index = faiss.read_index(str(self.index_path))
+            self.dimension = int(index.d)
+            return index
+
         return self._create_empty_index()
 
-    def _load_docstore(self) -> dict[str, VectorRecord]:
-        raw = read_json(self.docstore_path, default={})
-        return {k: VectorRecord(**v) for k, v in raw.items()}
+    def _load_docstore(self) -> None:
+        raw = read_json(self.docstore_path, {})
+
+        if isinstance(raw, dict) and "records" in raw:
+            records = raw.get("records", {})
+            self.index_to_chunk_id = list(
+                raw.get("index_to_chunk_id", [])
+            )
+        else:
+            # Old projects may have only records.
+            # We do NOT trust dictionary order for FAISS mapping.
+            records = raw if isinstance(raw, dict) else {}
+
+        self.docstore = {
+            key: VectorRecord(**value)
+            for key, value in records.items()
+        }
+
+    def _validate_mapping(self) -> None:
+        if self.index.ntotal == 0 and not self.docstore:
+            return
+
+        if len(self.index_to_chunk_id) != self.index.ntotal:
+            raise RuntimeError(
+                "FAISS index/docstore mapping is inconsistent. "
+                "Delete/rebuild the FAISS database."
+            )
+
+        missing = [
+            chunk_id
+            for chunk_id in self.index_to_chunk_id
+            if chunk_id not in self.docstore
+        ]
+
+        if missing:
+            raise RuntimeError(
+                "FAISS mapping references missing chunks. "
+                "Delete/rebuild the FAISS database."
+            )
 
     def add_chunks(self, chunks: list[Chunk]) -> None:
         if not chunks:
             return
+
+        # Avoid duplicate vectors.
+        new_chunks = [
+            chunk
+            for chunk in chunks
+            if chunk.chunk_id not in self.docstore
+        ]
+
+        if not new_chunks:
+            return
+
         model = self._get_embedding_model()
-        texts = [chunk.text for chunk in chunks]
-        embeddings = model.embed_documents(texts)
-        vectors = np.asarray(embeddings, dtype=np.float32)
+
+        vectors = np.asarray(
+            model.embed_documents(
+                [chunk.text for chunk in new_chunks]
+            ),
+            dtype=np.float32,
+        )
+
         if vectors.ndim == 1:
             vectors = vectors.reshape(1, -1)
-        if self.index is None or self.index.d != vectors.shape[1]:
-            self.index = faiss.IndexFlatIP(vectors.shape[1])
-            self.dimension = vectors.shape[1]
+
+        if vectors.shape[1] != self.index.d:
+            if self.index.ntotal == 0:
+                self.index = faiss.IndexFlatIP(
+                    vectors.shape[1]
+                )
+                self.dimension = vectors.shape[1]
+            else:
+                raise RuntimeError(
+                    "Embedding dimension changed. "
+                    "Delete/rebuild the FAISS database."
+                )
+
         self.index.add(vectors)
-        for chunk in chunks:
+
+        for chunk in new_chunks:
             self.docstore[chunk.chunk_id] = VectorRecord(
                 chunk_id=chunk.chunk_id,
                 source_id=chunk.source_id,
                 text=chunk.text,
                 metadata=chunk.metadata,
             )
+
+            self.index_to_chunk_id.append(
+                chunk.chunk_id
+            )
+
         self.persist()
 
     def persist(self) -> None:
-        ensure_dirs(self.index_path.parent, self.docstore_path.parent)
-        faiss.write_index(self.index, str(self.index_path))
-        write_json(self.docstore_path, {k: vars(v) for k, v in self.docstore.items()})
+        ensure_dirs(
+            self.index_path.parent,
+            self.docstore_path.parent,
+        )
+
+        faiss.write_index(
+            self.index,
+            str(self.index_path),
+        )
+
+        write_json(
+            self.docstore_path,
+            {
+                "records": {
+                    key: {
+                        "chunk_id": value.chunk_id,
+                        "source_id": value.source_id,
+                        "text": value.text,
+                        "metadata": value.metadata,
+                    }
+                    for key, value in self.docstore.items()
+                },
+                "index_to_chunk_id": self.index_to_chunk_id,
+            },
+        )
 
     def clear(self) -> None:
-        """Delete persisted vector artifacts and reset the in-memory store."""
-        if self.index_path.exists():
-            self.index_path.unlink()
-        if self.docstore_path.exists():
-            self.docstore_path.unlink()
+        self.index_path.unlink(missing_ok=True)
+        self.docstore_path.unlink(missing_ok=True)
+
+        self.docstore = {}
+        self.index_to_chunk_id = []
+
         self.embedding_model = None
         self.dimension = None
+
         self.index = self._create_empty_index()
-        self.docstore = {}
 
     def search(
         self,
         query_vector: list[float] | np.ndarray,
-        top_k: int = 6,
-        threshold: float = 0.2,
+        top_k: int = 8,
+        threshold: float = 0.0,
         filters: dict[str, str] | None = None,
-    ) -> list[dict[str, str | float]]:
-        """Search the index for similar vectors.
-        
-        Returns a list of dicts with 'text', 'metadata', etc.
-        Handles empty index gracefully.
-        """
-        if not self.docstore or self.index is None or self.index.ntotal == 0:
+    ) -> list[dict[str, Any]]:
+
+        if self.index.ntotal == 0:
             return []
-        
-        vector = np.asarray(query_vector, dtype=np.float32)
+
+        if not self.docstore:
+            return []
+
+        self._validate_mapping()
+
+        vector = np.asarray(
+            query_vector,
+            dtype=np.float32,
+        )
+
         if vector.ndim == 1:
             vector = vector.reshape(1, -1)
-        
-        distances, indices = self.index.search(vector, min(top_k, self.index.ntotal))
-        results = []
-        
-        for dist, idx in zip(distances[0], indices[0]):
-            if idx == -1 or dist < threshold:
+
+        if vector.shape[1] != self.index.d:
+            raise RuntimeError(
+                f"Query embedding dimension "
+                f"{vector.shape[1]} != FAISS dimension "
+                f"{self.index.d}"
+            )
+
+        k = min(
+            max(1, int(top_k)),
+            self.index.ntotal,
+        )
+
+        scores, indices = self.index.search(
+            vector,
+            k,
+        )
+
+        results: list[dict[str, Any]] = []
+
+        for score, idx in zip(
+            scores[0],
+            indices[0],
+        ):
+            idx = int(idx)
+            score = float(score)
+
+            if idx < 0:
                 continue
-            
-            # Find the record by index position
-            doc_id = None
-            for i, (k, v) in enumerate(self.docstore.items()):
-                if i == idx:
-                    doc_id = k
-                    break
-            
-            if doc_id is None:
+
+            if score < threshold:
                 continue
-            
-            record = self.docstore[doc_id]
-            
-            # Apply filters if provided
+
+            chunk_id = self.index_to_chunk_id[idx]
+
+            record = self.docstore.get(chunk_id)
+
+            if record is None:
+                continue
+
             if filters:
-                skip = False
-                for key, value in filters.items():
-                    if record.metadata.get(key) != value:
-                        skip = True
-                        break
-                if skip:
+                if any(
+                    record.metadata.get(key) != value
+                    for key, value in filters.items()
+                ):
                     continue
-            
-            results.append({
-                "id": record.chunk_id,
-                "text": record.text,
-                "metadata": {
-                    "source_id": record.source_id,
+
+            source = record.metadata.get(
+                "source",
+                record.metadata.get(
+                    "source_path",
+                    "unknown",
+                ),
+            )
+
+            results.append(
+                {
+                    "id": record.chunk_id,
                     "chunk_id": record.chunk_id,
-                    **record.metadata,
-                },
-                "distance": float(dist),
-            })
-        
+                    "text": record.text,
+                    "score": score,
+                    "metadata": {
+                        "source": source,
+                        "source_path": record.metadata.get(
+                            "source_path",
+                            source,
+                        ),
+                        "source_id": record.source_id,
+                        "chunk_id": record.chunk_id,
+                        **record.metadata,
+                    },
+                }
+            )
+
         return results
 
     def stats(self) -> dict[str, int | str]:
-        """Return vector index statistics for health panels."""
         return {
             "documents": len(self.docstore),
-            "vectors": int(self.index.ntotal) if self.index is not None else 0,
-            "dimension": int(self.index.d) if self.index is not None else "—",
+            "vectors": int(self.index.ntotal),
+            "dimension": int(self.index.d),
         }
 
 
 class VectorStore(FaissVectorStore):
-    """Backward-compatible alias for the FAISS vector store implementation."""
-
     pass
