@@ -21,15 +21,16 @@ def create_llm(
     """Create an OpenRouter-backed LangChain chat model."""
 
     try:
-        from langchain_openai import ChatOpenAI
+        from langchain_openrouter import ChatOpenRouter
     except ImportError as exc:
         raise RuntimeError(
-            "Missing dependency 'langchain-openai'."
+            "Missing dependency 'langchain-openrouter'. "
+            "Run: pip install -U langchain-openrouter"
         ) from exc
 
     cfg = settings or get_settings()
 
-    llm = ChatOpenAI(
+    return ChatOpenRouter(
         model=model or cfg.llm_model,
         temperature=(
             cfg.llm_temperature
@@ -37,13 +38,6 @@ def create_llm(
             else temperature
         ),
         api_key=cfg.require_openrouter_key(),
-        base_url=cfg.openrouter_base_url,
-        timeout=cfg.request_timeout,
+        max_tokens=700,
         max_retries=2,
-        default_headers={
-            "HTTP-Referer": "https://your-streamlit-app.streamlit.app",
-            "X-Title": cfg.app_name,
-        },
     )
-
-    return llm
