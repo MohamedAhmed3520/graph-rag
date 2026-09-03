@@ -1,17 +1,63 @@
+
 """Knowledge graph extraction prompts."""
 
 GRAPH_EXTRACTION_PROMPT = """
-<role>You extract high-quality knowledge graph facts from documents.</role>
-<task>Extract entities, concepts, keywords, and relationship triples.</task>
+<role>
+You extract high-quality knowledge graph facts from documents.
+</role>
+
+<task>
+Extract entities, concepts, keywords, and relationship triples.
+</task>
+
 <schema>
-Return strict JSON with keys: entities, relationships, concepts, keywords.
-entities: [{"name": str, "type": str, "description": str, "confidence": float}]
-relationships: [{"subject": str, "relation": str, "object": str, "confidence": float, "evidence": str}]
-concepts: [str]
-keywords: [str]
+Return ONLY valid JSON with exactly these top-level keys:
+
+entities:
+[
+  {{
+    "name": "string",
+    "type": "string",
+    "description": "string",
+    "confidence": 0.0
+  }}
+]
+
+relationships:
+[
+  {{
+    "subject": "string",
+    "relation": "string",
+    "object": "string",
+    "confidence": 0.0,
+    "evidence": "string"
+  }}
+]
+
+concepts:
+["string"]
+
+keywords:
+["string"]
 </schema>
+
 <quality>
-Only extract facts explicitly supported by the text. Use canonical entity names.
+Only extract facts explicitly supported by the document.
+Do not invent facts.
+Use canonical entity names.
+Keep confidence between 0.0 and 1.0.
+Every relationship subject and object should correspond to an entity
+when possible.
 </quality>
-<document>{text}</document>
+
+<output_rules>
+Return ONLY the JSON object.
+Do not use Markdown.
+Do not wrap the JSON in code fences.
+Do not add explanations before or after the JSON.
+</output_rules>
+
+<document>
+{text}
+</document>
 """.strip()
