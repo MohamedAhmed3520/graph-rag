@@ -1,76 +1,230 @@
-"""Graph search utilities for traversal-based retrieval and visualization."""
+"""Entity-term graph lookup followed by neighborhood traversal."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from graph.neo4j_store import Neo4jStore
-from utils.logger import get_logger
-
-logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
 class GraphSearchResult:
-    """Structured graph visualization result."""
-
     nodes: list[dict[str, Any]]
     relationships: list[dict[str, Any]]
 
 
 class GraphSearch:
-    """Search graph neighborhoods using Neo4j when available."""
-
-    def __init__(self, store: Neo4jStore | None = None) -> None:
+    def __init__(
+        self,
+        store: Neo4jStore | None = None,
+    ):
         self.store = store
 
     def _store(self) -> Neo4jStore:
         if self.store is None:
             self.store = Neo4jStore()
+
         return self.store
 
-    def search(self, query: str, limit: int = 10, relation_types: list[str] | None = None) -> list[dict[str, Any]]:
-        """Return triples relevant to a user query for Graph RAG context."""
+    @staticmethod
+    def _terms(query: str) -> list[str]:
+        stopwords = {
+            "what",
+            "which",
+            "who",
+            "where",
+            "when",
+            "why",
+            "how",
+            "is",
+            "are",
+            "the",
+            "a",
+            "an",
+            "of",
+            "to",
+            "for",
+            "in",
+            "on",
+            "and",
+            "or",
+            "with",
+            "from",
+            "about",
+            "explain",
+            "tell",
+            "me",
+            "does",
+            "do",
+            "can",
+            "could",
+            "would",
+            "different",
+            "types",
+            "give",
+            "please",
+        }
+
+        words = re.findall(
+            r"[A-Za-z0-9][A-Za-z0-9_-]{1,}",
+            query.lower(),
+        )
+
+        return [
+            word
+            for word in words
+            if word not in stopwords
+        ]
+
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        relation_types: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+
         store = self._store()
+
         if not store.is_available():
             return []
-        cypher = """
-        MATCH (s:Entity)-[r:RELATION]->(o:Entity)
-        WHERE ($query = '' OR toLower(s.name) CONTAINS toLower($query)
-               OR toLower(o.name) CONTAINS toLower($query)
-               OR toLower(r.relation) CONTAINS toLower($query))
-          AND (size($relation_types) = 0 OR r.relation IN $relation_types)
-        RETURN s.name AS subject, r.relation AS relation, o.name AS object,
-               coalesce(r.confidence, 0.0) AS confidence, coalesce(r.evidence, '') AS evidence,
-               coalesce(r.chunk_id, '') AS chunk_id
-        LIMIT $limit
-        """
-        try:
-            return store.query(cypher, {"query": query, "limit": limit, "relation_types": relation_types or []})
-        except Exception as exc:
-            logger.warning("Graph search failed: %s", exc)
+
+        terms = self._terms(query)
+
+        if not terms:
             return []
 
-    def subgraph(self, query: str = "", limit: int = 80) -> dict[str, list[dict[str, Any]]]:
-        """Return nodes and edges for interactive graph visualization."""
-        triples = self.search(query=query, limit=limit)
+        return store.query(
+            """
+            MATCH (seed:Entity)
+
+            WHERE any(
+                term IN $terms
+                WHERE toLower(seed.name) CONTAINS term
+            )
+
+            MATCH (seed)-[r:RELATION]-(neighbor:Entity)
+
+            WHERE
+                size($relation_types) = 0
+                OR r.relation IN $relation_types
+
+            RETURN
+                seed.name AS seed,
+
+                CASE
+                    WHEN startNode(r) = seed
+                    THEN seed.name
+                    ELSE neighbor.name
+                END AS subject,
+
+                r.relation AS relation,
+
+                CASE
+                    WHEN startNode(r) = seed
+                    THEN neighbor.name
+                    ELSE seed.name
+                END AS object,
+
+                coalesce(r.confidence, 0.0)
+                    AS confidence,
+
+                coalesce(r.evidence, '')
+                    AS evidence,
+
+                coalesce(r.chunk_id, '')
+                    AS chunk_id
+
+            ORDER BY confidence DESC
+
+            LIMIT $limit
+            """,
+            {
+                "terms": terms,
+                "limit": max(1, limit),
+                "relation_types": relation_types or [],
+            },
+        )
+
+    def subgraph(
+        self,
+        query: str = "",
+        limit: int = 80,
+    ) -> dict[str, list[dict[str, Any]]]:
+
+        triples = self.search(
+            query,
+            limit,
+        )
+
         nodes: dict[str, dict[str, Any]] = {}
         edges: list[dict[str, Any]] = []
+
         for triple in triples:
-            subject = str(triple.get("subject", ""))
-            obj = str(triple.get("object", ""))
+            subject = str(
+                triple.get("subject", "")
+            )
+            obj = str(
+                triple.get("object", "")
+            )
+
             if subject:
-                nodes.setdefault(subject, {"id": subject, "label": subject, "type": "Entity"})
+                nodes.setdefault(
+                    subject,
+                    {
+                        "id": subject,
+                        "name": subject,
+                        "label": subject,
+                        "type": "Entity",
+                    },
+                )
+
             if obj:
-                nodes.setdefault(obj, {"id": obj, "label": obj, "type": "Entity"})
+                nodes.setdefault(
+                    obj,
+                    {
+                        "id": obj,
+                        "name": obj,
+                        "label": obj,
+                        "type": "Entity",
+                    },
+                )
+
             if subject and obj:
-                edges.append({"source": subject, "target": obj, "label": triple.get("relation", "RELATION"), "type": triple.get("relation", "RELATION")})
-        return {"nodes": list(nodes.values()), "edges": edges}
+                edges.append(
+                    {
+                        "source": subject,
+                        "target": obj,
+                        "relation": triple.get(
+                            "relation",
+                            "RELATION",
+                        ),
+                        "confidence": triple.get(
+                            "confidence",
+                            0.0,
+                        ),
+                    }
+                )
+
+        return {
+            "nodes": list(nodes.values()),
+            "edges": edges,
+        }
 
 
 class GraphSearcher(GraphSearch):
-    """Backward-compatible alias for older imports."""
+    def search_result(
+        self,
+        query: str,
+        limit: int = 10,
+    ) -> GraphSearchResult:
 
-    def search_result(self, query: str, limit: int = 10) -> GraphSearchResult:
-        graph = self.subgraph(query=query, limit=limit)
-        return GraphSearchResult(nodes=graph["nodes"], relationships=graph["edges"])
+        graph = self.subgraph(
+            query,
+            limit,
+        )
+
+        return GraphSearchResult(
+            nodes=graph["nodes"],
+            relationships=graph["edges"],
+        )
