@@ -4,7 +4,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from config.models import create_llm
+from config.models import (
+    OpenRouterAuthError,
+    create_llm,
+    is_openrouter_auth_error,
+)
 from graph.entities import Entity, Relationship
 from prompts.extraction import GRAPH_EXTRACTION_PROMPT
 from utils.helpers import safe_format
@@ -176,6 +180,25 @@ class GraphExtractor:
                 )
 
             except Exception as exc:
+                # Auth failures are not chunk-specific: every chunk would fail
+                # the same way. Stop immediately with one actionable error
+                # instead of logging N identical tracebacks.
+                if isinstance(exc, OpenRouterAuthError) or is_openrouter_auth_error(exc):
+                    message = (
+                        str(exc)
+                        if isinstance(exc, OpenRouterAuthError)
+                        else (
+                            "Graph extraction cannot continue because the "
+                            "OpenRouter API key was rejected: "
+                            f"'{exc}'. Please verify OPENROUTER_API_KEY."
+                        )
+                    )
+                    logger.error(
+                        "Aborting graph extraction: "
+                        "OpenRouter authentication failed."
+                    )
+                    raise OpenRouterAuthError(message) from exc
+
                 logger.exception(
                     "Graph extraction failed for chunk %s: %s",
                     index + 1,

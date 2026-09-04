@@ -6,7 +6,11 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from config.models import create_llm
+from config.models import (
+    OpenRouterAuthError,
+    create_llm,
+    is_openrouter_auth_error,
+)
 from config.settings import get_settings
 
 from embeddings.vector_store import VectorStore
@@ -152,6 +156,23 @@ def extract_graph(
             "status": (
                 f"Extracted graph facts "
                 f"from {len(docs)} chunks"
+            ),
+        }
+
+    except OpenRouterAuthError as exc:
+        return {
+            **state,
+            "graph_documents": [],
+            "errors": [
+                *state.get("errors", []),
+                (
+                    "OpenRouter authentication failed, so graph extraction "
+                    f"was skipped: {exc}"
+                ),
+            ],
+            "status": (
+                "OpenRouter API key invalid; "
+                "graph extraction skipped"
             ),
         }
 
@@ -563,17 +584,44 @@ def generate_answer(
         ),
     )
 
-    answer = str(
-        create_llm()
-        .invoke(
-            [
-                HumanMessage(
-                    content=content
+    try:
+        answer = str(
+            create_llm()
+            .invoke(
+                [
+                    HumanMessage(
+                        content=content
+                    )
+                ]
+            )
+            .content
+        ).strip()
+
+    except Exception as exc:
+        if isinstance(exc, OpenRouterAuthError) or is_openrouter_auth_error(exc):
+            message = (
+                str(exc)
+                if isinstance(exc, OpenRouterAuthError)
+                else (
+                    "The OpenRouter API key was rejected "
+                    f"('{exc}'). Update OPENROUTER_API_KEY in Streamlit "
+                    "Secrets and try again."
                 )
-            ]
-        )
-        .content
-    ).strip()
+            )
+            return {
+                **state,
+                "answer": (
+                    "⚠️ I couldn't answer because the LLM API rejected the "
+                    f"configured API key.\n\n{message}"
+                ),
+                "citations": [],
+                "errors": [
+                    *state.get("errors", []),
+                    message,
+                ],
+                "status": "OpenRouter authentication failed",
+            }
+        raise
 
     citations: list[dict[str, Any]] = []
 

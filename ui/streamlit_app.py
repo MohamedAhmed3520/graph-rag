@@ -35,8 +35,55 @@ from workflow.workflow import (
 
 
 def render_health_panel(settings) -> None:
-    """Render live FAISS and Neo4j health information."""
+    """Render live OpenRouter, FAISS and Neo4j health information."""
     st.subheader("📊 RAG Health")
+
+    # -------------------------
+    # OpenRouter / LLM key
+    # -------------------------
+    st.markdown("### 🤖 OpenRouter (LLM)")
+
+    try:
+        _, source = settings.resolve_openrouter_key()
+        source_label = {
+            "streamlit": "Streamlit Secrets",
+            "env": "environment variable",
+            "env_file": ".env file (committed)",
+        }.get(source, source)
+        st.caption(f"Active key source: **{source_label}**")
+
+        if source == "env_file":
+            st.warning(
+                "The API key is being read from the committed `.env` file. "
+                "Set `OPENROUTER_API_KEY` in Streamlit → App settings → "
+                "Secrets; it now takes precedence."
+            )
+    except Exception as exc:
+        st.error(f"No OpenRouter key configured: {exc}")
+
+    if st.button("🔑 Test OpenRouter key", use_container_width=False):
+        with st.spinner("Verifying OpenRouter API key..."):
+            result = settings.verify_openrouter_key()
+        status = result.get("status")
+        message = result.get("message", "")
+        if status == "ok":
+            st.success(message)
+            detail = result.get("detail")
+            if isinstance(detail, dict):
+                st.caption(
+                    "Usage / limit: "
+                    + ", ".join(
+                        f"{k}={v}"
+                        for k, v in detail.items()
+                        if k in {"limit", "usage", "limit_remaining", "is_free_tier"}
+                    )
+                )
+        elif status == "invalid":
+            st.error(message)
+        else:
+            st.warning(message)
+
+    st.divider()
 
     col1, col2 = st.columns(2)
 
@@ -373,6 +420,34 @@ def run() -> None:
             )
 
         else:
+
+            # Preflight: confirm the OpenRouter key is valid before spending
+            # time on parsing/extraction, which otherwise fails per-chunk.
+            with st.spinner("Checking OpenRouter API key..."):
+                key_check = settings.verify_openrouter_key()
+
+            if key_check.get("status") == "missing":
+                st.error(
+                    "No OpenRouter API key is configured. Add "
+                    "`OPENROUTER_API_KEY` in Streamlit → App settings → "
+                    f"Secrets. ({key_check.get('message', '')})"
+                )
+                st.stop()
+
+            if key_check.get("status") == "invalid":
+                st.error(key_check.get("message"))
+                st.info(
+                    "Get a valid key at https://openrouter.ai/keys, then set "
+                    "it in Streamlit → App settings → Secrets as "
+                    "`OPENROUTER_API_KEY`."
+                )
+                st.stop()
+
+            if key_check.get("status") == "error":
+                st.warning(
+                    "Could not verify the OpenRouter key up front "
+                    f"({key_check.get('message')}). Continuing anyway."
+                )
 
             paths = save_uploaded_files(
                 uploaded,
