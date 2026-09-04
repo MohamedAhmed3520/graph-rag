@@ -23,7 +23,12 @@ class LoadedDocument:
 
 
 def load_documents(paths: Iterable[Path]) -> list[LoadedDocument]:
-    """Load supported files from the provided paths."""
+    """Read supported files from disk as raw bytes.
+
+    Parsing (PDF/DOCX text extraction) is handled downstream by
+    ``ingestion.parser.parse_document`` so the loader stays a lightweight,
+    format-agnostic byte reader.
+    """
     documents: list[LoadedDocument] = []
     for path in paths:
         if not path.exists() or not path.is_file():

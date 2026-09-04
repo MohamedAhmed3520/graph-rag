@@ -77,6 +77,53 @@ class GraphSearch:
             if word not in stopwords
         ]
 
+    def _sample(
+        self,
+        limit: int = 10,
+        relation_types: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return a general sample of the graph when no query terms match.
+
+        This is used so the graph visualization has something to show even
+        before the user types a search term (the term-based ``search`` returns
+        nothing for an empty query, which used to make the graph appear
+        "undetected"/empty).
+        """
+        store = self._store()
+
+        if not store.is_available():
+            return []
+
+        return store.query(
+            """
+            MATCH (s:Entity)-[r:RELATION]->(o:Entity)
+
+            WHERE
+                size($relation_types) = 0
+                OR r.relation IN $relation_types
+
+            RETURN
+                s.name AS seed,
+                s.name AS subject,
+                r.relation AS relation,
+                o.name AS object,
+                coalesce(r.confidence, 0.0)
+                    AS confidence,
+                coalesce(r.evidence, '')
+                    AS evidence,
+                coalesce(r.chunk_id, '')
+                    AS chunk_id
+
+            ORDER BY confidence DESC
+
+            LIMIT $limit
+            """,
+            {
+                "limit": max(1, limit),
+                "relation_types": relation_types or [],
+            },
+        )
+
     def search(
         self,
         query: str,
@@ -156,6 +203,13 @@ class GraphSearch:
             query,
             limit,
         )
+
+        # When the query is empty (or none of its terms match an entity) fall
+        # back to a general sample so the graph is visible instead of blank.
+        if not triples:
+            triples = self._sample(
+                limit,
+            )
 
         nodes: dict[str, dict[str, Any]] = {}
         edges: list[dict[str, Any]] = []
