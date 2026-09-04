@@ -1,6 +1,10 @@
 """Centralized runtime configuration for local and Streamlit deployments."""
 from __future__ import annotations
 
+import json
+import os
+import urllib.error
+import urllib.request
 from functools import lru_cache
 from pathlib import Path
 
@@ -107,24 +111,156 @@ class Settings(BaseSettings):
 
     request_timeout: int = 90
 
-    def require_openrouter_key(self) -> str:
-        """Return OpenRouter key from env/.env or Streamlit secrets."""
-        if self.openrouter_api_key and self.openrouter_api_key.strip():
-            return self.openrouter_api_key.strip()
-
+    def _streamlit_secret(self, name: str) -> str | None:
+        """Read a single value from Streamlit secrets when running under Streamlit."""
         try:
             import streamlit as st
 
-            secret = st.secrets.get("OPENROUTER_API_KEY")
-            if secret:
-                return str(secret).strip()
+            value = st.secrets.get(name)
+            if value and str(value).strip():
+                return str(value).strip()
         except Exception:
             pass
+        return None
+
+    def resolve_openrouter_key(self) -> tuple[str, str]:
+        """Return ``(api_key, source)`` for the OpenRouter API key.
+
+        Resolution order (highest precedence first):
+
+        1. Streamlit secrets (``st.secrets["OPENROUTER_API_KEY"]``) — the
+           intended mechanism on Streamlit Cloud. This deliberately wins over a
+           committed ``.env`` so an outdated key baked into the repo can never
+           shadow the secret configured in the Streamlit Cloud dashboard.
+        2. A real OS environment variable (``OPENROUTER_API_KEY``) — used when
+           deploying locally or on other hosts that inject env vars.
+        3. The value loaded from the ``.env`` file by pydantic-settings.
+
+        The returned ``source`` is one of ``"streamlit"``, ``"env"``,
+        ``"env_file"`` and is used for diagnostics so it is obvious which key
+        is active.
+        """
+
+        secret = self._streamlit_secret("OPENROUTER_API_KEY")
+        if secret:
+            return secret, "streamlit"
+
+        env_value = os.environ.get("OPENROUTER_API_KEY")
+        if env_value and env_value.strip():
+            # If os.environ mirrors the .env file pydantic already loaded,
+            # attribute it to the env file; otherwise it is a real env var.
+            source = "env"
+            if (
+                self.openrouter_api_key
+                and env_value.strip() == self.openrouter_api_key.strip()
+            ):
+                source = "env_file"
+            return env_value.strip(), source
+
+        if self.openrouter_api_key and self.openrouter_api_key.strip():
+            return self.openrouter_api_key.strip(), "env_file"
 
         raise RuntimeError(
-            "OPENROUTER_API_KEY is missing. "
-            "Configure it in Streamlit Secrets or .env."
+            "OPENROUTER_API_KEY is missing. Add it to Streamlit Secrets "
+            "(App settings -> Secrets) or to a local .env file."
         )
+
+    def require_openrouter_key(self) -> str:
+        """Return the resolved OpenRouter API key (raises if none is configured)."""
+        return self.resolve_openrouter_key()[0]
+
+    def verify_openrouter_key(
+        self,
+        timeout: float = 10.0,
+    ) -> dict[str, object]:
+        """Validate the configured OpenRouter key against the /key endpoint.
+
+        Returns a dict with:
+            status:  "ok" | "missing" | "invalid" | "error"
+            source:  where the key came from
+                     ("streamlit"/"env"/"env_file")
+            message: human-readable description
+            detail:  extra info from OpenRouter (e.g. limit/usage) when present
+        """
+
+        try:
+            api_key, source = self.resolve_openrouter_key()
+        except Exception as exc:
+            return {
+                "status": "missing",
+                "source": None,
+                "message": str(exc),
+                "detail": None,
+            }
+
+        url = f"{self.openrouter_base_url.rstrip('/')}/key"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(
+                    response.read().decode("utf-8", errors="replace")
+                )
+
+            detail = payload.get("data", payload)
+            return {
+                "status": "ok",
+                "source": source,
+                "message": "OpenRouter API key is valid.",
+                "detail": detail,
+            }
+
+        except urllib.error.HTTPError as exc:
+            # 401 -> bad/unknown key ("User not found"), 402 -> out of credit,
+            # 429 -> rate limited.
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+
+            if exc.code in (401, 403):
+                message = (
+                    "OpenRouter rejected the API key (HTTP "
+                    f"{exc.code}). The key is invalid, revoked, or copied "
+                    "incorrectly. Create a fresh key at "
+                    "https://openrouter.ai/keys and update it in Streamlit "
+                    "Secrets (key name: OPENROUTER_API_KEY)."
+                )
+                status = "invalid"
+            elif exc.code == 402:
+                message = (
+                    "OpenRouter reports the account is out of credits "
+                    "(HTTP 402). Add credits at "
+                    "https://openrouter.ai/credits."
+                )
+                status = "error"
+            else:
+                message = f"OpenRouter returned HTTP {exc.code}."
+                status = "error"
+
+            return {
+                "status": status,
+                "source": source,
+                "message": message,
+                "detail": body[:500] or None,
+            }
+
+        except urllib.error.URLError as exc:
+            return {
+                "status": "error",
+                "source": source,
+                "message": (
+                    f"Could not reach OpenRouter to verify the key: {exc.reason}. "
+                    "Check the network/proxy configuration."
+                ),
+                "detail": None,
+            }
 
     def resolve_neo4j(
         self,
@@ -146,14 +282,9 @@ class Settings(BaseSettings):
         if value:
             return str(value).strip()
 
-        try:
-            import streamlit as st
-
-            secret = st.secrets.get(key)
-            if secret:
-                return str(secret).strip()
-        except Exception:
-            pass
+        secret = self._streamlit_secret(key)
+        if secret:
+            return secret
 
         return default
 
