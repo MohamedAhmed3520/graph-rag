@@ -7,6 +7,7 @@ from typing import Any
 from config.models import create_llm
 from graph.entities import Entity, Relationship
 from prompts.extraction import GRAPH_EXTRACTION_PROMPT
+from utils.helpers import safe_format
 from utils.logger import get_logger
 
 
@@ -33,8 +34,9 @@ class GraphExtractor:
                 "keywords": [],
             }
 
-        prompt = GRAPH_EXTRACTION_PROMPT.format(
-            text=text
+        prompt = safe_format(
+            GRAPH_EXTRACTION_PROMPT,
+            text=text,
         )
 
         response = self.llm.invoke(prompt)

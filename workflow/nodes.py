@@ -24,6 +24,7 @@ from prompts.answer import ANSWER_PROMPT
 from prompts.grading import GRADING_PROMPT
 from prompts.rewrite import REWRITE_PROMPT
 
+from utils.helpers import safe_format
 from workflow.state import GraphRAGState
 
 
@@ -248,10 +249,15 @@ def rewrite_query(
     try:
         llm = create_llm()
 
+        rewrite_prompt = safe_format(
+            REWRITE_PROMPT,
+            question=question,
+        )
+
         response = llm.invoke(
             [
                 SystemMessage(
-                    content=REWRITE_PROMPT
+                    content=rewrite_prompt
                 ),
                 HumanMessage(
                     content=question
@@ -431,7 +437,8 @@ def grade_retrieved_context(
         }
 
     try:
-        content = GRADING_PROMPT.format(
+        content = safe_format(
+            GRADING_PROMPT,
             question=state.get(
                 "question",
                 "",
@@ -544,7 +551,8 @@ def generate_answer(
             ),
         }
 
-    content = ANSWER_PROMPT.format(
+    content = safe_format(
+        ANSWER_PROMPT,
         question=state.get(
             "question",
             "",
